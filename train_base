@@ -1,0 +1,242 @@
+import argparse
+from model_v1.select_old import get_random_sample
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch import optim
+from ViT_Adapter.adam_adapter import vit_adapter
+from ViT_Adapter.adam_vpt import vit_vpt
+from ViT_Adapter.adam_ssf import vit_ssf
+from dualp.coda import vit_pt_imnet
+from LAE.lae import vit_lae
+from datasets import Complete_Datasets, TestDatasets
+from utils import *
+import numpy as np
+from clip_ import Model as CLIP_AT
+from valid import test
+import torch.nn.functional as F
+def class_loss(query, key, tau=0.07):
+        query = F.normalize(query, p=2, dim=1)
+        key = F.normalize(key, p=2, dim=1)
+        logits = torch.einsum('nc,ck->nk', [query, key.detach().T])
+        logits /= tau
+        return logits
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='Sketchy')
+    # parser.add_argument('--dataset', type=str, default='TUBerlin')
+    parser.add_argument('--root', type=str, default="../")
+
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--seed', type=int, default=57)
+    parser.add_argument('--epoches', type=int, default=30)
+    parser.add_argument('--ratio', type=int, default=1)
+    parser.add_argument('--img_ratio', type=int, default=0)
+    parser.add_argument('--pre_w', type=str, default="vit.pth")
+    # parser.add_argument('--type', type=str, default="ssf")
+    # parser.add_argument('--type', type=str, default="vpt")
+    # parser.add_argument('--type', type=str, default="adapter")
+    # parser.add_argument('--type', type=str, default="LAE")
+    parser.add_argument('--type', type=str, default="CLIP_AT")
+    # parser.add_argument('--type', type=str, default=dual")
+    # parser.add_argument('--type', type=str, default="coda")
+    # parser.add_argument('--type', type=str, default="l2p")
+
+    args = parser.parse_args()
+    return args
+
+
+def main(args, stage, known_number):
+    print("STAGE: ", stage)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+    datasets = Complete_Datasets(root=args.root, stage=stage, datasets=args.dataset, known_number=known_number,
+                                 v_ratio=args.ratio, img_ratio=args.img_ratio)
+    only_img = datasets.only_img
+    only_skt = datasets.only_skt
+
+    img_set = TestDatasets(root=args.root, datasets=args.dataset, m='im', stage=stage)
+    skt_set = TestDatasets(root=args.root, datasets=args.dataset, m='sk', stage=stage)
+    img_loader = DataLoader(img_set, batch_size=1024, num_workers=4, pin_memory=True, )
+    skt_loader = DataLoader(skt_set, batch_size=1024, num_workers=4, pin_memory=True, )
+    
+    print(args.type)
+    dim = 768
+    if args.type == "vpt":
+        model = vit_vpt()
+    elif args.type == "ssf":
+        model = vit_ssf()
+    elif args.type == "LAE":
+        model = vit_lae()
+    elif args.type == "adapter":
+        model = vit_adapter()
+    elif args.type == "l2p" or args.type == "dual" or args.type == "coda":
+        model = vit_pt_imnet(prompt_flag = args.type)
+    elif args.type == "CLIP_AT":
+  
+        import clip
+        clip_model, _ = clip.load('ViT-B/16', device="cuda")
+        tokenizer = clip.tokenize
+        
+        prototype_txt = clip_model.encode_text(tokenizer(datasets.name).cuda()).detach()
+        
+        model = CLIP_AT(25*stage)
+        dim = 512
+
+    if stage > 1:
+        if args.type == "vpt":
+            args.epoches = 10
+        elif   args.type == "CLIP_AT":
+            args.epoches = 15
+        else:
+            args.epoches = 20
+        print("load", f'weights/model_{args.dataset}_{stage-1}_{args.type}.pth')
+        parameters = torch.load(f'weights/model_{args.dataset}_{stage-1}_{args.type}.pth')
+        model.load_state_dict(parameters['model'], strict=False)
+        print(datasets.get_number_class(), known_number)
+        prototype_txt = torch.cat([parameters["prototype_txt"].cuda(), prototype_txt], dim=0)
+        datasets.add_old(parameters["img_old"], parameters["skt_old"], parameters["only_img"], parameters["only_skt"])
+    if args.type == "CLIP_AT":
+        print(prototype_txt.shape)
+    data_loader = DataLoader(datasets, batch_size=args.batch_size, num_workers=4, pin_memory=True, shuffle=False)
+    model.classifier = nn.Linear(dim, datasets.get_number_class())
+    print(datasets.get_number_class(), known_number)
+    model = model.cuda()
+
+    ce_criterion = nn.CrossEntropyLoss().cuda()
+    tri_criterion = nn.TripletMarginLoss().cuda()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    fp16_scaler = torch.cuda.amp.GradScaler()
+
+    l_1 = AverageMeter()
+    l_2 = AverageMeter()
+    l_3 = AverageMeter()
+    l_4 = AverageMeter()
+    l_5 = AverageMeter()
+    l_6 = AverageMeter()
+    l_7 = AverageMeter()
+
+    for epoch in range(1, args.epoches + 1):
+        l_1.reset(), l_2.reset(), l_3.reset(), l_4.reset(), l_5.reset(), l_6.reset(), l_7.reset()
+
+        for idx, (img, skt, neg, neg_skt, label, m, neg_label, neg_skt_label) \
+                in enumerate(tqdm(data_loader)):
+            img = img.cuda()
+            skt = skt.cuda()
+            neg = neg.cuda()
+            neg_skt = neg_skt.cuda()
+            label = label.cuda()
+            neg_label = neg_label.cuda()
+            neg_skt_label = neg_skt_label.cuda()
+
+            with (torch.cuda.amp.autocast(fp16_scaler is not None)):
+                if args.type == "l2p" or args.type == "dual" or args.type == "coda":
+                    img,_ = model(img,train=True, id = 1)
+                    skt,_ = model(skt,train=True, id = 0)
+                    neg,_ = model(neg,train=True, id = 1)
+                    neg_skt,_ = model(neg_skt,train=True, id = 0)
+                else:
+                    img = model(img)
+                    skt = model(skt)
+                    neg = model(neg)
+                    neg_skt = model(neg_skt)
+
+                #classify
+                logits = model.classifier(torch.cat((img, skt, neg, neg_skt), dim=0))
+                loss_cls = ce_criterion(logits, torch.cat((label, label, neg_label, neg_skt_label), dim=0))
+                l_5.update(loss_cls.item())
+
+                # loss_tri = ce_criterion(*moco_queue(skt, img))
+                loss_tri = tri_criterion(torch.cat([skt, skt], dim=0),
+                                         torch.cat([img, img], dim=0),
+                                         torch.cat([neg, neg_skt], dim=0))
+                l_2.update(loss_tri.item())
+
+                loss = loss_tri + loss_cls
+
+                if args.type == "CLIP_AT":
+                    logits = class_loss(torch.cat((img, skt), dim=0), prototype_txt)
+                    loss_sem = ce_criterion(logits, torch.cat((label, label), dim=0))
+                    loss += loss_sem
+                
+                l_1.update(loss.item())
+
+                optimizer.zero_grad()
+                fp16_scaler.scale(loss).backward()
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
+
+        print(f"{epoch}:{args.epoches}total: {l_1.avg:.4f}, tri: {l_2.avg:.4f} cls: {l_5.avg:.4f}")
+
+    model.eval()
+
+    img_old, skt_old = get_random_sample(model, root=args.root, datasets=args.dataset, known_class=known_number,
+                                        stage=stage, only = {"img":only_img, "skt":only_skt})
+    if stage>1:
+        for key in parameters["img_old"]:
+            img_old[key] = parameters["img_old"][key]
+            skt_old[key] = parameters["skt_old"][key]
+
+    print("store_old_classes", img_old.keys())
+    
+    save_dict = {
+        "model": model.state_dict(),
+        "only_img" : datasets.only_img,
+        "only_skt" : datasets.only_skt,
+        "img_old" : img_old,
+        "skt_old" : skt_old,
+    }
+    if args.type == "CLIP_AT":
+        save_dict = {
+            "model": model.state_dict(),
+            "prototype_txt": prototype_txt.cpu(),
+            "only_img" : datasets.only_img,
+            "only_skt" : datasets.only_skt,
+            "img_old" : img_old,
+            "skt_old" : skt_old,
+        }
+    torch.save(save_dict, f'weights/model_{args.dataset}_{stage}_{args.type}.pth')
+    i_map = 1
+    prec = 1
+    i_map, prec = test(img_loader, skt_loader, model, model)
+    return i_map, prec, datasets.get_number_class()
+
+
+if __name__ == '__main__':
+    args = get_args()
+    import time
+
+    # for i in range(20):
+    #     time.sleep(60)
+    #     print(f"{i+1}分钟")
+    # print("20 分钟已过，现在开始运行程序！")
+
+    if args.dataset == 'TUBerlin':
+        stages = 5
+    else:
+        stages = 5
+
+    if args.type == "vpt":
+        args.epoches = 20
+    map_all = []
+    prec_all = []
+    if args.dataset == 'TUBerlin':
+        known_number = len(map_all) * 50
+    else:
+        known_number = len(map_all) * 25
+
+    for stage_ in range(len(map_all),stages):
+        # map, prec, known_number = main(args, stage_ + 1, known_number)
+        map, prec, known_number = main(args, stage_ + 1, known_number)
+        map_all.append(map)
+        prec_all.append(prec)
+
+    print(map_all, "\n", np.mean(np.array(map_all), axis=0))
+    print(prec_all, "\n", np.mean(np.array(prec_all), axis=0))
