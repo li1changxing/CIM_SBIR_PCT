@@ -1,0 +1,224 @@
+import argparse
+from model_v1.select_old import get_great_sample
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch import optim
+from prototype import Prototype
+from model_v1.GAT import get_graph
+from model_v1.my_model import mymodel as Model
+from datasets import Complete_Datasets, TestDatasets
+from utils import *
+import numpy as np
+import clip
+from valid import test
+
+clip_model, _ = clip.load('ViT-B/16', device="cuda")
+tokenizer = clip.tokenize
+
+# from gensim.models import KeyedVectors
+# word2vec_model = KeyedVectors.load_word2vec_format('../GoogleNews-vectors-negative300.bin', binary=True)
+# word2vec_model = KeyedVectors.load_word2vec_format('../glove.6B.txt', binary=False)
+# def get_word2vec_embedding(word, model):
+#     # 直接获取单个词的词向量
+#     if word in model:
+#         return model[word]
+#     else:
+#         return np.zeros(model.vector_size)
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='Sketchy')
+    # parser.add_argument('--dataset', type=str, default='TUBerlin')
+    parser.add_argument('--root', type=str, default="../")
+
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--seed', type=int, default=57)
+    parser.add_argument('--epoches', type=int, default=40)
+    parser.add_argument('--ratio', type=int, default=1)
+    parser.add_argument('--img_ratio', type=int, default=0)
+    parser.add_argument('--dim', type=int, default=512)
+    parser.add_argument('--pre_w', type=str, default="vit.pth")
+    # parser.add_argument('--MOCO_k', type=int, default=16384)
+    parser.add_argument('--MOCO_k', type=int, default=4096)
+
+    args = parser.parse_args()
+    return args
+
+
+def main(args, stage, known_number):
+    print("STAGE: ", stage)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+
+    datasets = Complete_Datasets(root=args.root, stage=stage, datasets=args.dataset, known_number=known_number,
+                                 v_ratio=args.ratio, img_ratio=args.img_ratio)
+    only_img = datasets.only_img
+    only_skt = datasets.only_skt
+
+    img_set = TestDatasets(root=args.root, datasets=args.dataset, m='im', stage=stage)
+    skt_set = TestDatasets(root=args.root, datasets=args.dataset, m='sk', stage=stage)
+    img_loader = DataLoader(img_set, batch_size=1024, num_workers=4, pin_memory=True, )
+    skt_loader = DataLoader(skt_set, batch_size=1024, num_workers=4, pin_memory=True, )
+
+    prototype_txt = clip_model.encode_text(tokenizer(datasets.name).cuda()).detach()
+    # prototype_txt =[get_word2vec_embedding(item, word2vec_model) for item in datasets.name]
+    # prototype_txt = torch.tensor(prototype_txt).float().cuda()
+    
+    model = Model(known_number,pre_weigth=args.pre_w)
+    center_img = torch.zeros((datasets.get_number_class(), 512))
+    center_skt = torch.zeros((datasets.get_number_class(), 512))
+
+    if stage > 1:
+        args.epoches = 20
+        print("load", f'weights/model_{args.dataset}_{stage-1}1.pth')
+        parameters = torch.load(f'weights/model_{args.dataset}_{stage-1}1.pth')
+        model.load_state_dict(parameters['model'], strict=False)
+        prototype_txt = torch.cat([parameters["prototype_txt"].cuda(), prototype_txt], dim=0)
+        center_skt = torch.cat([parameters["center_skt"], center_skt], dim=0)
+        center_img = torch.cat([parameters["center_img"], center_img], dim=0)
+        print(center_skt.shape, center_img.shape, prototype_txt.shape, datasets.get_number_class(), known_number)
+        datasets.add_old(parameters["img_old"], parameters["skt_old"], parameters["only_img"], parameters["only_skt"])
+
+    data_loader = DataLoader(datasets, batch_size=args.batch_size, num_workers=4, pin_memory=True, shuffle=False)
+    model.reset(datasets.get_number_class())
+    model = model.cuda()
+
+    proto = Prototype(center_skt, center_img).cuda()
+
+    ce_criterion = nn.CrossEntropyLoss().cuda()
+    tri_criterion = nn.TripletMarginLoss().cuda()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    fp16_scaler = torch.cuda.amp.GradScaler()
+
+    l_1 = AverageMeter()
+    l_2 = AverageMeter()
+    l_3 = AverageMeter()
+    l_4 = AverageMeter()
+    l_5 = AverageMeter()
+    l_6 = AverageMeter()
+    l_7 = AverageMeter()
+
+    for epoch in range(1, args.epoches + 1):
+        l_1.reset(), l_2.reset(), l_3.reset(), l_4.reset(), l_5.reset(), l_6.reset(), l_7.reset()
+
+        for idx, (img, skt, neg, neg_skt, label, m, neg_label, neg_skt_label) \
+                in enumerate(tqdm(data_loader)):
+            img = img.cuda()
+            skt = skt.cuda()
+            neg = neg.cuda()
+            neg_skt = neg_skt.cuda()
+            label = label.cuda()
+            neg_label = neg_label.cuda()
+            neg_skt_label = neg_skt_label.cuda()
+            m = m.cuda()  #m!=1, m=0,2 skt, m!=2, m=0,1 img
+
+            img_m, skt_m = torch.zeros_like(m), torch.zeros_like(m)
+            img_m = img_m.cuda()
+            skt_m = skt_m.cuda()
+
+            img_m = torch.cat([m, img_m], dim=0)
+            skt_m = torch.cat([m, skt_m], dim=0)
+
+            with (torch.cuda.amp.autocast(fp16_scaler is not None)):
+                img = model(img)
+                skt = model(skt)
+                neg = model(neg)
+                neg_skt = model(neg_skt)
+
+                #classify
+                logits = model.classifier(torch.cat((img, skt, neg, neg_skt), dim=0))
+                loss_cls = ce_criterion(logits, torch.cat((label, label, neg_label, neg_skt_label), dim=0))
+                l_5.update(loss_cls.item())
+
+                # loss_tri = ce_criterion(*moco_queue(skt, img))
+                loss_tri = tri_criterion(torch.cat([skt, skt], dim=0),
+                                         torch.cat([img, img], dim=0),
+                                         torch.cat([neg, neg_skt], dim=0))
+                l_2.update(loss_tri.item())
+
+                img = torch.cat([img, neg], dim=0)
+                skt = torch.cat([skt, neg_skt], dim=0)
+                img_label = torch.cat([label, neg_label], dim=0)
+                skt_label = torch.cat([label, neg_skt_label], dim=0)
+
+                img_graph = get_graph(img, img)
+                skt_graph = get_graph(skt, skt)
+                img_p = model.p_head(img_graph, img_graph.ndata['feat'])
+                skt_p = model.p_head(skt_graph, skt_graph.ndata['feat'])
+
+                if img_p[img_m == 2].shape != 0:
+                    # img_p[img_m == 2] = select_knn(img_p[img_m == 2], img_p, img_p, k = 5).float()
+                    img_p[img_m == 2] = select_knn(skt_p[img_m == 2], skt_p[img_m !=2], img_p[img_m !=2], k = 5).float()
+
+                if skt_p[skt_m == 1].shape != 0:
+                    # skt_p[skt_m == 1] = select_knn(img_p[skt_m == 1], skt_p, skt_p, k = 5).float()
+                    skt_p[skt_m == 1] = select_knn(img_p[img_m == 1], skt_p[img_m !=1], img_p[img_m !=1], k = 5).float()
+
+                loss_cos_img, batch_img_label = proto.forward_img(img_p, img_label)
+                loss_cos_skt, batch_skt_label = proto.forward_skt(skt_p, skt_label)
+
+                loss_cross = loss_cos_img + loss_cos_skt
+                l_4.update(loss_cross.item())
+
+                logits = proto.class_loss(torch.cat((proto.center_skt[batch_skt_label],
+                                                            proto.center_img[batch_img_label]), dim=0),
+                                          prototype_txt)
+                loss_sem = ce_criterion(logits, torch.cat((batch_skt_label, batch_img_label), dim=0))
+                l_3.update(loss_sem.item())
+
+                loss = loss_tri + loss_cls + loss_cross + loss_sem
+                l_1.update(loss.item())
+
+                optimizer.zero_grad()
+                fp16_scaler.scale(loss).backward()
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
+
+        print(f"{epoch}:{args.epoches}total: {l_1.avg:.4f}, tri: {l_2.avg:.4f}\n"
+              f"sem: {l_3.avg:.4f}, cos: {l_4.avg:.4f}, cls: {l_5.avg:.4f}")
+        # if stage > 1 and epoch % 5 == 0:
+        #     i_map, prec = test(img_loader, skt_loader, model, model)
+
+    model.eval()
+
+    img_old, skt_old = get_great_sample(model, root=args.root, datasets=args.dataset, known_class=known_number,
+                                        stage=stage, only = {"img":only_img, "skt":only_skt})
+    if stage>1:
+        for key in parameters["img_old"]:
+            img_old[key] = parameters["img_old"][key]
+            skt_old[key] = parameters["skt_old"][key]
+
+    print("store_old_classes", img_old.keys())
+
+    save_dict = {
+        "model": model.state_dict(),
+        "prototype_txt": prototype_txt.cpu(),
+        "center_img": proto.center_img.cpu(),
+        "center_skt": proto.center_skt.cpu(),
+        "only_img" : datasets.only_img,
+        "only_skt" : datasets.only_skt,
+        "img_old" : img_old,
+        "skt_old" : skt_old,
+    }
+    torch.save(save_dict, f'weights/model_{args.dataset}_{stage}1.pth')
+    i_map, prec = test(img_loader, skt_loader, model, model)
+    return i_map, prec, datasets.get_number_class()
+
+
+if __name__ == '__main__':
+    args = get_args()
+
+    stages = 5
+    map_all = []
+    prec_all = []
+    known_number = len(map_all) * 25
+
+    for stage_ in range(len(map_all),stages):
+        # map, prec, known_number = main(args, stage_ + 1, known_number)
+        map, prec, known_number = main(args, stage_ + 1, known_number)
+        map_all.append(map)
+        prec_all.append(prec)
+
+    print(map_all, "\n", np.mean(np.array(map_all), axis=0))
+    print(prec_all, "\n", np.mean(np.array(prec_all), axis=0))
