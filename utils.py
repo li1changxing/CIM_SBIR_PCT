@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data
 class AverageMeter(object):
     """Computes and stores the average and current value.
     """
@@ -19,6 +18,11 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+def sem_loss(query, center_txt,tau=0.07):
+        logits = torch.einsum('nc,ck->nk', [query, center_txt.detach().T])
+        logits /= tau
+        return logits
 
 class MOCO(nn.Module):
     """
@@ -60,6 +64,8 @@ class MOCO(nn.Module):
         with torch.no_grad():  # no gradient to keys
             key = nn.functional.normalize(key, dim=1)
 
+        query = nn.functional.normalize(query,dim=1)
+
         # compute logits
         # Einstein sum is more intuitive
         # positive logits: Nx1
@@ -81,17 +87,42 @@ class MOCO(nn.Module):
 
         return logits, labels
 
+def select_knn(skt_fea, img_fea, all_skt, k = 5):
+    skt_fea_norm = nn.functional.normalize(skt_fea, p=2, dim=-1).detach()
+    img_fea_norm = nn.functional.normalize(img_fea, p=2, dim=-1).detach()
+
+    similarity_matrix = torch.mm(skt_fea_norm, img_fea_norm.T)
+    similarity_scores, top_k_indices = torch.topk(similarity_matrix, k, dim=1)
+
+    similarity_scores = torch.softmax(similarity_scores, dim=-1).unsqueeze(-1)
+    img_select = all_skt[top_k_indices]
+    img_select = img_select * similarity_scores
+    img_select = torch.sum(img_select, dim=1)
+
+    return img_select.float()
+
+
+def recover_sketch(image_features, sketch_features, k=5):
+    # image_features: Tensor, shape (n_images, feature_dim)
+    # sketch_features: Tensor, shape (n_sketches, feature_dim)
+
+    # Compute cosine similarity
+    similarity = torch.mm(image_features, sketch_features.T)
+    print(similarity.shape)
+
+    # Select top-k most similar sketches for each image
+    topk_values, topk_indices = torch.topk(similarity, k, dim=1)
+
+    # Apply softmax to the similarity scores
+    weights = nn.functional.softmax(topk_values, dim=1).unsqueeze(-1)
+
+    # Weighted sum to recover sketches
+    # recovered_sketches = torch.matmul(weights, sketch_features[topk_indices])
+    recovered_sketches = weights * sketch_features[topk_indices]
+
+    return recovered_sketches
 
 if __name__ == '__main__':
-    from torch_geometric.nn import GCNConv
-
-    model = GCNConv(384, 384)
-
-    data1 = torch.randn(256,384)
-    data2 = torch.randn(128,384)
-    sim = torch.mm(data1,data2.T)
-
-    data = Data(x=data1, edge_index=sim)
-    out = model(data.x, data.edge_index)
-    print(out.shape)
-
+    img_fea = torch.randn((4,768))
+    skt_fea = torch.randn((16,768))
+    print(recover_sketch(img_fea, skt_fea).shape)
