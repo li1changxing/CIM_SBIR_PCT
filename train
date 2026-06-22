@@ -29,13 +29,13 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='Sketchy')
     # parser.add_argument('--dataset', type=str, default='TUBerlin')
-    parser.add_argument('--root', type=str, default="../")
+    parser.add_argument('--root', type=str, default="../../")
 
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--seed', type=int, default=57)
-    parser.add_argument('--epoches', type=int, default=40)
-    parser.add_argument('--ratio', type=int, default=1)
-    parser.add_argument('--img_ratio', type=int, default=0)
+    parser.add_argument('--epoches', type=int, default=30)
+    parser.add_argument('--ratio', type=int, default=0.6)
+    parser.add_argument('--img_ratio', type=int, default=0.2)
     parser.add_argument('--dim', type=int, default=512)
     parser.add_argument('--pre_w', type=str, default="vit.pth")
     # parser.add_argument('--MOCO_k', type=int, default=16384)
@@ -47,13 +47,9 @@ def get_args():
 
 def main(args, stage, known_number):
     print("STAGE: ", stage)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    np.random.seed(args.seed)
 
     datasets = Complete_Datasets(root=args.root, stage=stage, datasets=args.dataset, known_number=known_number,
                                  v_ratio=args.ratio, img_ratio=args.img_ratio)
@@ -73,6 +69,10 @@ def main(args, stage, known_number):
     center_img = torch.zeros((datasets.get_number_class(), 512))
     center_skt = torch.zeros((datasets.get_number_class(), 512))
 
+    # if stage == 1:
+    #     args.epoches = 0
+    #     parameters = torch.load(f'weights/model_{args.dataset}_{1}1.pth')
+    #     model.load_state_dict(parameters['model'], strict=False)
     if stage > 1:
         args.epoches = 20
         print("load", f'weights/model_{args.dataset}_{stage-1}1.pth')
@@ -171,7 +171,7 @@ def main(args, stage, known_number):
                 loss_sem = ce_criterion(logits, torch.cat((batch_skt_label, batch_img_label), dim=0))
                 l_3.update(loss_sem.item())
 
-                loss = loss_tri + loss_cls + loss_cross + loss_sem
+                loss = loss_tri + 0.01 * (loss_cls + loss_cross) + loss_sem
                 l_1.update(loss.item())
 
                 optimizer.zero_grad()
@@ -213,7 +213,13 @@ def main(args, stage, known_number):
 if __name__ == '__main__':
     args = get_args()
 
+    # if args.dataset == 'TUBerlin':
+    #     stages = 10
+    # else:
+    #     stages = 5
     stages = 5
+    # map_all = [0.9379488433607465]
+    # map_all = [0.9499848013227409,0.8534273795377423,0.7616507220046631, 0.7001445798522181, 0.6425082217513987]
     map_all = []
     prec_all = []
     known_number = len(map_all) * 25
